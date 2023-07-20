@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.optimize as spo
+import math
 
 class Inert:
     """A nonreactive ion class.
@@ -16,6 +17,10 @@ class Inert:
     conc : float
         The concentration of this species in solution.
 
+    ion_charges : array of int
+        The charge of each ion in solution. For Na2SO4:
+        [1, 1, -2]
+
     Attributes
     ----------
     charge : int
@@ -25,13 +30,14 @@ class Inert:
         The concentration of this species in solution.
 
     """
-    def __init__(self, charge=None, conc=None):
+    def __init__(self, charge=None, conc=None, ion_charges=[0]):
         if charge == None:
             raise ValueError(
                 "The charge for this ion must be defined.")
 
         self.charge = charge 
         self.conc = conc
+        self.ion_charges = ion_charges
 
     def alpha(self, pH):
         '''Return the fraction of each species at a given pH.
@@ -86,6 +92,13 @@ class Acid:
         The formal concentration of this acid in solution. This value must be
         defined.
 
+    dpka_dt : 0.0 (default), float
+        Change in pKa per degree centigrade, commonly expressed as d(pKa)/dt
+
+    ion_charges : array of int
+        The charge of each ion in solution. For Na2SO4:
+        [1, 1, -2]
+
     Note
     ----
     There is no corresponding Base object. To define a base, you must use a
@@ -93,7 +106,7 @@ class Acid:
     examples.
 
     '''
-    def __init__(self, Ka=None, pKa=None, charge=None, conc=None):
+    def __init__(self, Ka=None, pKa=None, charge=None, conc=None, dpka_dt=0.0, ion_charges=[0]):
         # Do a couple quick checks to make sure that everything has been
         # defined.
         if Ka == None and pKa == None:
@@ -129,7 +142,43 @@ class Acid:
         # Make a list of charges for each species defined by the Ka values.
         self.charge = np.arange(charge, charge - len(self.Ka) - 1, -1)
         # Make sure the concentrations are accessible to the object instance.
-        self.conc = conc 
+        self.conc = conc
+        self.dpka_dt = dpka_dt
+        self.ion_charges = ion_charges
+
+    def compensate_temp_conc(self, temp):
+        # Begin temperature compensation
+        # Assume pKa values reflect 25C and infinite dilution
+        temp_dev = temp - 25.0
+        # Calculate adjustment factor to be added to pKa value(s)
+        temp_adjustment = temp_dev * self.dpka_dt
+        # This will work regardless of whether self.pKa is a numpy
+        # array or an int or float.
+        self.pKa = self.pKa + temp_adjustment
+        # Begin ionic activity compensation
+        # The science here is questionable as of now...
+        ic = 0
+        for charge in self.ion_charges:
+            ic += 0.5 * (charge ** 2)
+
+        z = sum(self.ion_charges)
+        ionic_strength = ic * self.conc
+        ionic_sqrt = math.sqrt(ionic_strength)
+
+        if self.conc < 0.200:
+            ionic_adjustment = (0.509 * z * ionic_sqrt) / (1 + (1.6 * ionic_sqrt))
+        else:
+            ionic_adjustment = (0.509 * z) * ((ionic_sqrt) / (1 + ionic_sqrt) - (0.2 * ionic_strength))
+        self.pKa = self.pKa + ionic_adjustment
+        print('Adjusted pKa = ', self.pKa)
+        # Begin reinitialization
+        # Recalculate Ka
+        self.Ka = 10 ** (-self.pKa)
+        # Reinitialize _Ka_temp
+        self._Ka_temp = np.append(1., self.Ka)
+        # Charge array is based on length of Ka array which won't change with temp correction
+        # so no reinitialization is required.
+
 
     def alpha(self, pH):
         '''Return the fraction of each species at a given pH.
@@ -202,6 +251,9 @@ class System:
         temperature, for example. The default value is for water at
         298 K and 1 atm.
 
+    temp : float (default 25.0)
+        The temperature of the system in degrees C
+
     Attibutes
     ---------
     species : list
@@ -219,9 +271,24 @@ class System:
         The pH of this particular system. This is only calculated after
         running the pHsolve method.
     '''
-    def __init__(self, *species, Kw=1.01e-14):
+    def __init__(self, *species, Kw=1.01e-14, temp=25.0):
         self.species = species
-        self.Kw = Kw
+        # Regression of pKw values taken from Wikipedia article on self-ionization of water:
+        # y = 7E-05x^2 - 0.031x + 14.764 (y is pKw and x is degrees centigrade)
+        # if temp is not 25.0, then compute Kw from pKw
+        if temp == 25.0:
+            self.Kw = Kw
+        else:
+            pKw = (7e-5 * (temp ** 2)) - (0.031 * temp) + 14.764
+            tcKw = 10 ** (-1.0 * pKw)
+            print(tcKw)
+            self.Kw = tcKw
+
+        for spec in self.species:
+            # if (conc < Davis) {dpKa=(0.509 * Z * IonSt) / (1+1.6 * IonSt); model="class=\"Huckel\""}
+            # else {dpKa=0.509 * Z * ((IonSt / (1+IonSt))-0.2 * IonS); model="class=\"Davis\""}
+            if isinstance(spec, Acid):
+                spec.compensate_temp_conc(temp)
 
 
     def _diff_pos_neg(self, pH):
@@ -326,6 +393,14 @@ class System:
 
 
 if __name__ == '__main__':
+    # 150mM NaCl, 92.66mM Tris, 62.95 Acetic Acid
+    nacl = Inert(charge=0, conc=0.15, ion_charges=[1, -1])
+    tris = Acid(charge=1, pKa=8.072, conc=0.09266, dpka_dt=-0.028, ion_charges=[1, 0])
+    acetic = Acid(charge=0, pKa=4.756, conc=0.06295, dpka_dt=0.0002, ion_charges=[0, -1])
+    s = System(nacl, tris, acetic, temp=20.0)
+    s.pHsolve()
+    print('150mM NaCl, 92.66mM Tris, 62.95 Acetic = ', s.pH)
+
     # KOH, just need to define the amount of K+, solver takes care of the
     # rest.
     a = Inert(charge=+1, conc=0.1)
